@@ -761,9 +761,10 @@ def main():
 
     # Auto-refresh timer while running (smooth enough, low load)
     if st.session_state.running and not st.session_state.paused:
-        time.sleep(0.25)
+        time.sleep(2)
         st.rerun()
 
 
 if __name__ == "__main__":
     main()
+
