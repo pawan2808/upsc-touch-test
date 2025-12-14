@@ -1,10 +1,18 @@
+import io
+import json
 import time
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+
+# PDF export
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
+
 
 # ---------------------------
 # Excel schema
@@ -16,8 +24,10 @@ COL_C = "Option C"
 COL_D = "Option D"
 COL_CORRECT = "Correct Answer"   # A/B/C/D
 COL_EXPL = "Explanation"
+COL_SECTION = "Section"          # OPTIONAL
 
-REQUIRED_COLS = [COL_QUESTION, COL_A, COL_B, COL_C, COL_D, COL_CORRECT, COL_EXPL]
+REQUIRED_COLS = [COL_QUESTION, COL_A, COL_B, COL_C, COL_D, COL_CORRECT]
+OPTIONAL_COLS = [COL_EXPL, COL_SECTION]
 
 
 # ---------------------------
@@ -27,24 +37,35 @@ REQUIRED_COLS = [COL_QUESTION, COL_A, COL_B, COL_C, COL_D, COL_CORRECT, COL_EXPL
 class MCQ:
     qid: int
     question: str
-    options: Dict[str, str]   # A/B/C/D -> text
-    correct: str              # A/B/C/D
-    explanation: str          # text
+    options: Dict[str, str]        # A/B/C/D -> text
+    correct: str                   # A/B/C/D
+    explanation: str               # text
+    section: str                   # optional, default "General"
 
 
 # ---------------------------
 # Helpers
 # ---------------------------
+def fmt_hhmmss(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def load_excel_mcqs(uploaded_file) -> List[MCQ]:
     df = pd.read_excel(uploaded_file, engine="openpyxl")
 
-    # allow missing Explanation column (auto-add)
     for col in REQUIRED_COLS:
         if col not in df.columns:
-            if col == COL_EXPL:
-                df[COL_EXPL] = ""
-            else:
-                raise ValueError(f"Missing required column: {col}")
+            raise ValueError(f"Missing required column: {col}")
+
+    # Optional columns
+    if COL_EXPL not in df.columns:
+        df[COL_EXPL] = ""
+    if COL_SECTION not in df.columns:
+        df[COL_SECTION] = "General"
 
     mcqs: List[MCQ] = []
     qid = 1
@@ -67,12 +88,23 @@ def load_excel_mcqs(uploaded_file) -> List[MCQ]:
         if expl.lower() == "nan":
             expl = ""
 
-        mcqs.append(MCQ(qid=qid, question=q, options=opts, correct=corr, explanation=expl))
+        sec = str(r.get(COL_SECTION, "General")).strip()
+        if not sec or sec.lower() == "nan":
+            sec = "General"
+
+        mcqs.append(MCQ(qid=qid, question=q, options=opts, correct=corr, explanation=expl, section=sec))
         qid += 1
 
     if not mcqs:
         raise ValueError("No valid questions found in the Excel.")
     return mcqs
+
+
+def filter_by_section(pool: List[MCQ], sections: List[str]) -> List[MCQ]:
+    if not sections or "All" in sections:
+        return list(pool)
+    sset = set(sections)
+    return [m for m in pool if m.section in sset]
 
 
 def pick_questions(pool: List[MCQ], n: int, randomize: bool) -> List[MCQ]:
@@ -82,22 +114,19 @@ def pick_questions(pool: List[MCQ], n: int, randomize: bool) -> List[MCQ]:
     if randomize:
         random.shuffle(items)
     chosen = items[:n]
-    # re-number qids 1..n
     for i, m in enumerate(chosen, start=1):
         m.qid = i
     return chosen
 
 
-def fmt_hhmmss(seconds: int) -> str:
-    seconds = max(0, int(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def compute_report(mcqs: List[MCQ], answers: Dict[int, Optional[str]], time_spent: Dict[int, float],
-                   total_seconds: int, remaining_seconds: int, negative_ratio: float = 1/3):
+def compute_report(
+    mcqs: List[MCQ],
+    answers: Dict[int, Optional[str]],
+    time_spent: Dict[int, float],
+    total_seconds: int,
+    remaining_seconds: int,
+    negative_mark: float,
+) -> Tuple[dict, pd.DataFrame]:
     total = len(mcqs)
     correct = wrong = unanswered = 0
     score = 0.0
@@ -116,11 +145,12 @@ def compute_report(mcqs: List[MCQ], answers: Dict[int, Optional[str]], time_spen
         else:
             wrong += 1
             res = "Wrong"
-            marks = -negative_ratio
+            marks = -float(negative_mark)
 
         score += marks
         rows.append({
             "#": m.qid,
+            "Section": m.section,
             "Your": your or "",
             "Correct": m.correct,
             "Result": res,
@@ -142,51 +172,206 @@ def compute_report(mcqs: List[MCQ], answers: Dict[int, Optional[str]], time_spen
         "unanswered": unanswered,
         "accuracy": round(accuracy, 1),
         "time_taken": fmt_hhmmss(int(time_taken)),
+        "negative_mark": float(negative_mark),
     }
-    return summary, rows
+    return summary, pd.DataFrame(rows)
+
+
+def make_pdf(summary: dict, df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+
+    def draw_wrapped(text: str, x: float, y: float, max_w: float, line_h: float) -> float:
+        # simple wrap
+        words = (text or "").split()
+        line = ""
+        while words:
+            test = (line + " " + words[0]).strip()
+            if c.stringWidth(test, "Helvetica", 10) <= max_w:
+                line = test
+                words.pop(0)
+            else:
+                c.drawString(x, y, line)
+                y -= line_h
+                line = ""
+                if y < 2 * cm:
+                    c.showPage()
+                    y = h - 2 * cm
+        if line:
+            c.drawString(x, y, line)
+            y -= line_h
+        return y
+
+    y = h - 2 * cm
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(2 * cm, y, "UPSC Practice Test Report")
+    y -= 1.0 * cm
+
+    c.setFont("Helvetica", 11)
+    lines = [
+        f"Score: {summary['score']}/{summary['total']}",
+        f"Correct: {summary['correct']}   Wrong: {summary['wrong']}   Unanswered: {summary['unanswered']}",
+        f"Accuracy: {summary['accuracy']}%   Time: {summary['time_taken']}",
+        f"Negative mark per wrong: -{summary['negative_mark']}",
+    ]
+    for ln in lines:
+        c.drawString(2 * cm, y, ln)
+        y -= 0.7 * cm
+
+    y -= 0.2 * cm
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(2 * cm, y, "Review (first 50 rows shown)")
+    y -= 0.8 * cm
+
+    c.setFont("Helvetica", 10)
+    max_rows = min(50, len(df))
+    for i in range(max_rows):
+        r = df.iloc[i]
+        header = f"Q{int(r['#'])} | Your: {r['Your'] or '-'} | Correct: {r['Correct']} | {r['Result']} | Section: {r.get('Section','')}"
+        y = draw_wrapped(header, 2 * cm, y, w - 4 * cm, 12)
+        y = draw_wrapped(f"Q: {r['Question']}", 2 * cm, y, w - 4 * cm, 12)
+        expl = r.get("Explanation", "")
+        if expl:
+            y = draw_wrapped(f"Exp: {expl}", 2 * cm, y, w - 4 * cm, 12)
+        y -= 0.2 * cm
+        if y < 2 * cm:
+            c.showPage()
+            y = h - 2 * cm
+            c.setFont("Helvetica", 10)
+
+    c.save()
+    return buf.getvalue()
+
+
+def state_digest() -> str:
+    """A small signature to detect changes and autosave progress."""
+    mcqs = st.session_state.get("mcqs", [])
+    answers = st.session_state.get("answers", {})
+    remaining = st.session_state.get("remaining_seconds", 0)
+    cur = st.session_state.get("current", 0)
+    payload = {
+        "n": len(mcqs),
+        "answers": answers,
+        "remaining": remaining,
+        "current": cur,
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def export_progress_json() -> bytes:
+    payload = {
+        "mcqs": [
+            {
+                "qid": m.qid,
+                "question": m.question,
+                "options": m.options,
+                "correct": m.correct,
+                "explanation": m.explanation,
+                "section": m.section,
+            }
+            for m in st.session_state.mcqs
+        ],
+        "answers": st.session_state.answers,
+        "time_spent": st.session_state.time_spent,
+        "current": st.session_state.current,
+        "running": st.session_state.running,
+        "paused": st.session_state.paused,
+        "total_seconds": st.session_state.total_seconds,
+        "remaining_seconds": st.session_state.remaining_seconds,
+        "negative_mark": st.session_state.negative_mark,
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def import_progress_json(file_bytes: bytes):
+    data = json.loads(file_bytes.decode("utf-8"))
+    mcqs = []
+    for d in data["mcqs"]:
+        mcqs.append(MCQ(
+            qid=int(d["qid"]),
+            question=str(d["question"]),
+            options=dict(d["options"]),
+            correct=str(d["correct"]),
+            explanation=str(d.get("explanation","")),
+            section=str(d.get("section","General")),
+        ))
+
+    st.session_state.mcqs = mcqs
+    st.session_state.answers = {int(k): (v if v in ("A","B","C","D") else None) for k, v in data["answers"].items()}
+    st.session_state.time_spent = {int(k): float(v) for k, v in data.get("time_spent", {}).items()}
+    st.session_state.current = int(data.get("current", 0))
+    st.session_state.running = bool(data.get("running", False))
+    st.session_state.paused = bool(data.get("paused", False))
+    st.session_state.total_seconds = int(data.get("total_seconds", 20*60))
+    st.session_state.remaining_seconds = int(data.get("remaining_seconds", st.session_state.total_seconds))
+    st.session_state.negative_mark = float(data.get("negative_mark", 1/3))
+    st.session_state.last_tick = None
+    st.session_state.q_enter_ts = None
+    st.session_state.show_report = False
 
 
 # ---------------------------
-# Touch-first CSS
+# Touch-first CSS (no radio styling; avoids vertical text issue)
 # ---------------------------
-TOUCH_CSS = """
-<style>
-/* Make app look like a touch app */
-html, body, [class*="css"]  {
-  font-size: 18px !important;
-}
-button[kind="primary"], button[kind="secondary"] {
-  padding: 14px 18px !important;
-  border-radius: 14px !important;
-  font-weight: 800 !important;
-}
-div.stRadio > div {
-  gap: 12px !important;
-}
-div.stRadio label {
-  border: 2px solid rgba(120,120,120,0.35);
-  border-radius: 16px;
-  padding: 14px 14px;
-  margin: 6px 0px;
-}
-div.stRadio label:hover {
-  background: rgba(34,197,94,0.18);
-}
-.small-muted {
-  color: rgba(120,120,120,0.9);
-  font-size: 0.95rem;
-}
-.card {
-  border: 2px solid rgba(120,120,120,0.25);
-  border-radius: 18px;
-  padding: 14px 14px;
-}
-.timer {
-  font-size: 1.35rem;
-  font-weight: 900;
-}
-</style>
-"""
+def apply_css(dark: bool):
+    if dark:
+        bg = "#0b1220"
+        card = "#0f172a"
+        text = "#e5e7eb"
+        muted = "#94a3b8"
+        border = "rgba(148,163,184,0.25)"
+        btn = "#2563eb"
+        btn2 = "#10b981"
+    else:
+        bg = "#f7f9fc"
+        card = "#ffffff"
+        text = "#0f172a"
+        muted = "rgba(60,60,60,0.75)"
+        border = "rgba(15,23,42,0.12)"
+        btn = "#1d4ed8"
+        btn2 = "#059669"
+
+    st.markdown(f"""
+    <style>
+    .stApp {{
+      background: {bg};
+      color: {text};
+    }}
+    .card {{
+      border: 2px solid {border};
+      border-radius: 18px;
+      padding: 14px 14px;
+      background: {card};
+    }}
+    .muted {{
+      color: {muted};
+      font-size: 0.95rem;
+    }}
+    .timer {{
+      font-size: 1.25rem;
+      font-weight: 900;
+    }}
+    /* Bigger touch buttons */
+    div.stButton > button {{
+      padding: 14px 16px !important;
+      border-radius: 16px !important;
+      font-weight: 900 !important;
+      width: 100% !important;
+      white-space: normal !important;
+      line-height: 1.2 !important;
+    }}
+    /* Make primary buttons look consistent */
+    div.stButton > button[kind="primary"] {{
+      background: {btn} !important;
+      border: 0 !important;
+    }}
+    /* Reduce top padding */
+    section.main > div {{
+      padding-top: 1.0rem;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
 
 
 # ---------------------------
@@ -205,6 +390,27 @@ def init_state():
     st.session_state.setdefault("last_tick", None)
     st.session_state.setdefault("q_enter_ts", None)
     st.session_state.setdefault("show_report", False)
+
+    st.session_state.setdefault("dark_mode", False)
+    st.session_state.setdefault("negative_mark", 1/3)
+
+    # Autosave: store last snapshot in session (cloud-safe)
+    st.session_state.setdefault("autosave_enabled", True)
+    st.session_state.setdefault("autosave_snapshot", None)
+    st.session_state.setdefault("autosave_last_digest", "")
+
+
+def commit_time_for_current():
+    mcqs = st.session_state.mcqs
+    if not mcqs:
+        return
+    idx = max(0, min(st.session_state.current, len(mcqs) - 1))
+    qid = mcqs[idx].qid
+    enter = st.session_state.q_enter_ts
+    if enter is None:
+        return
+    st.session_state.time_spent[qid] = st.session_state.time_spent.get(qid, 0.0) + max(0.0, time.time() - enter)
+    st.session_state.q_enter_ts = None
 
 
 def start_test():
@@ -241,20 +447,6 @@ def stop_test():
     st.session_state.show_report = True
 
 
-def commit_time_for_current():
-    mcqs = st.session_state.mcqs
-    if not mcqs:
-        return
-    idx = st.session_state.current
-    idx = max(0, min(idx, len(mcqs) - 1))
-    qid = mcqs[idx].qid
-    enter = st.session_state.q_enter_ts
-    if enter is None:
-        return
-    st.session_state.time_spent[qid] = st.session_state.time_spent.get(qid, 0.0) + max(0.0, time.time() - enter)
-    st.session_state.q_enter_ts = None
-
-
 def tick_timer():
     if not st.session_state.running or st.session_state.paused:
         return
@@ -265,9 +457,7 @@ def tick_timer():
         return
     dt = now - last
     st.session_state.last_tick = now
-
     st.session_state.remaining_seconds = max(0, int(st.session_state.remaining_seconds - dt))
-
     if st.session_state.remaining_seconds <= 0:
         stop_test()
 
@@ -285,53 +475,92 @@ def goto(idx: int):
     st.session_state.current = idx
 
 
+def autosave_if_needed():
+    if not st.session_state.autosave_enabled:
+        return
+    d = state_digest()
+    if d != st.session_state.autosave_last_digest:
+        st.session_state.autosave_snapshot = export_progress_json()
+        st.session_state.autosave_last_digest = d
+
+
 # ---------------------------
-# Streamlit App
+# UI blocks
 # ---------------------------
+def option_button(letter: str, text: str, selected: bool, disabled: bool, key: str) -> bool:
+    # Show a small selected indicator
+    label = f"{letter}. {text}"
+    if selected:
+        label = f"✅ {label}"
+    return st.button(label, key=key, disabled=disabled, use_container_width=True)
+
+
 def main():
-    st.set_page_config(page_title="UPSC Touch Test (Excel Only)", layout="wide")
-    st.markdown(TOUCH_CSS, unsafe_allow_html=True)
+    st.set_page_config(page_title="UPSC Touch Test (Cloud)", layout="wide")
     init_state()
 
-    tick_timer()  # update timer on each rerun
+    # timer tick per rerun
+    tick_timer()
+
+    # Theme
+    apply_css(st.session_state.dark_mode)
 
     st.title("UPSC Touch Test (Excel Only)")
-    st.markdown('<div class="small-muted">iPad/touch-friendly. No ChatGPT/OpenAI features. Excel → Test → Analysis.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="muted">iPad-friendly layout. No ChatGPT/OpenAI. Excel → Test → Analysis → PDF export.</div>', unsafe_allow_html=True)
 
-    # Sidebar setup
+    # ---------------- Sidebar: Setup / Controls ----------------
     with st.sidebar:
         st.header("Setup")
+
+        st.session_state.dark_mode = st.toggle("Night/Dark mode", value=st.session_state.dark_mode)
+        st.session_state.autosave_enabled = st.toggle("Autosave progress", value=st.session_state.autosave_enabled)
+
         uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 
-        with st.expander("Excel format instructions", expanded=False):
-            st.write("Your Excel must have these columns:")
-            st.code(
-                "\n".join(REQUIRED_COLS),
-                language="text"
-            )
-            st.write("Correct Answer must be A/B/C/D. Explanation can be blank.")
+        with st.expander("Excel format instructions"):
+            st.write("Required columns:")
+            st.code("\n".join(REQUIRED_COLS), language="text")
+            st.write("Optional columns:")
+            st.code("\n".join(OPTIONAL_COLS), language="text")
+            st.write("If you include a 'Section' column, you can run section-wise tests.")
 
         if uploaded is not None:
             try:
                 pool = load_excel_mcqs(uploaded)
                 st.session_state.pool = pool
-                st.success(f"Loaded {len(pool)} questions from Excel.")
+                st.success(f"Loaded {len(pool)} questions.")
             except Exception as e:
                 st.session_state.pool = None
                 st.error(str(e))
 
+        pool = st.session_state.pool or []
+        sections = sorted({m.section for m in pool}) if pool else []
+        section_choices = ["All"] + sections if sections else ["All"]
+
+        selected_sections = st.multiselect("Section-wise test", options=section_choices, default=["All"])
+
         qcount = st.number_input("Questions (1–100)", min_value=1, max_value=100, value=20, step=1)
-        randomize = st.checkbox("Randomize selection", value=False)
+        randomize = st.checkbox("Randomize selection", value=True)
 
         minutes = st.number_input("Timer (minutes)", min_value=1, max_value=300, value=20, step=1)
 
+        st.session_state.negative_mark = st.slider(
+            "UPSC negative marking (per wrong)",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state.negative_mark),
+            step=0.05
+        )
+
         st.divider()
 
-        colA, colB, colC = st.columns(3)
-        with colA:
-            if st.button("Load / Apply", type="primary", use_container_width=True, disabled=st.session_state.pool is None):
-                pool = st.session_state.pool
-                chosen = pick_questions(pool, qcount, randomize)
+        # Load / Apply
+        if st.button("Load / Apply Question Set", type="primary", use_container_width=True, disabled=st.session_state.pool is None):
+            filt = filter_by_section(st.session_state.pool, selected_sections)
+            if not filt:
+                st.error("No questions found for the selected section(s).")
+            else:
+                chosen = pick_questions(filt, qcount, randomize)
                 st.session_state.mcqs = chosen
                 st.session_state.answers = {m.qid: None for m in chosen}
                 st.session_state.time_spent = {m.qid: 0.0 for m in chosen}
@@ -343,94 +572,119 @@ def main():
                 st.session_state.last_tick = None
                 st.session_state.q_enter_ts = None
                 st.session_state.show_report = False
-                st.toast("Question set ready.", icon="✅")
+                autosave_if_needed()
+                st.success("Ready. Press Start.")
 
-        with colB:
-            if st.button("Start", use_container_width=True, disabled=not st.session_state.mcqs or st.session_state.running):
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Start", use_container_width=True, disabled=(not st.session_state.mcqs) or st.session_state.running):
                 start_test()
-
-        with colC:
+        with c2:
             if st.button("Stop & Report", use_container_width=True, disabled=not st.session_state.mcqs):
                 stop_test()
 
-        colD, colE = st.columns(2)
-        with colD:
-            if st.button("Pause", use_container_width=True, disabled=not st.session_state.running or st.session_state.paused):
+        c3, c4 = st.columns(2)
+        with c3:
+            if st.button("Pause", use_container_width=True, disabled=(not st.session_state.running) or st.session_state.paused):
                 pause_test()
-        with colE:
-            if st.button("Resume", use_container_width=True, disabled=not st.session_state.running or not st.session_state.paused):
+        with c4:
+            if st.button("Resume", use_container_width=True, disabled=(not st.session_state.running) or (not st.session_state.paused)):
                 resume_test()
 
-    mcqs = st.session_state.mcqs
+        st.divider()
 
+        # Progress backup (cloud-safe "autosave": snapshot in session; user can download)
+        if st.session_state.autosave_snapshot:
+            st.download_button(
+                "Download autosave (JSON)",
+                data=st.session_state.autosave_snapshot,
+                file_name="upsc_autosave.json",
+                mime="application/json",
+                use_container_width=True
+            )
+
+        uploaded_save = st.file_uploader("Restore progress (JSON)", type=["json"], key="restore_json")
+        if uploaded_save is not None:
+            try:
+                import_progress_json(uploaded_save.read())
+                st.success("Progress restored.")
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
+
+    # ---------------- Main: Test UI ----------------
+    mcqs: List[MCQ] = st.session_state.mcqs
     if not mcqs:
-        st.info("Upload an Excel in the sidebar, then click **Load / Apply**.")
+        st.info("Upload Excel → choose options → click **Load / Apply Question Set** (sidebar).")
         return
 
-    # Main layout
-    left, right = st.columns([2.4, 1])
+    # Autosave whenever state changes
+    autosave_if_needed()
 
-    # Left: question card
+    # Header bar (compact)
+    top = st.container()
+    with top:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        colA, colB, colC, colD = st.columns([1.3, 1.2, 1.2, 1.4])
+        with colA:
+            st.markdown(f"<div class='timer'>Time left: {fmt_hhmmss(st.session_state.remaining_seconds)}</div>", unsafe_allow_html=True)
+        with colB:
+            st.markdown(f"<div><b>Status:</b> {'Running' if st.session_state.running else 'Stopped'}{' (Paused)' if st.session_state.paused else ''}</div>", unsafe_allow_html=True)
+        with colC:
+            cur = st.session_state.current + 1
+            st.markdown(f"<div><b>Question:</b> {cur}/{len(mcqs)}</div>", unsafe_allow_html=True)
+        with colD:
+            unanswered = sum(1 for m in mcqs if st.session_state.answers.get(m.qid) is None)
+            st.markdown(f"<div><b>Unanswered:</b> {unanswered}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Two-column layout: Question/Options + Palette
+    left, right = st.columns([2.4, 1.0], gap="large")
+
+    idx = st.session_state.current
+    m = mcqs[idx]
+    running = st.session_state.running
+
     with left:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-
-        timer_str = fmt_hhmmss(st.session_state.remaining_seconds)
-        st.markdown(f'<div class="timer">Time left: {timer_str}</div>', unsafe_allow_html=True)
-
-        idx = st.session_state.current
-        m = mcqs[idx]
-
-        st.subheader(f"Q{idx + 1} of {len(mcqs)}")
+        st.subheader(f"Q{idx+1}. {m.section}")
         st.write(m.question)
 
-        # Touch-friendly radio; store choice
-        key = f"ans_{m.qid}"
-        current_val = st.session_state.answers.get(m.qid)
+        # Options in a 2x2 grid (always visible; no scrolling for option D)
+        selected = st.session_state.answers.get(m.qid)
 
-        # Streamlit radio expects the exact option label in list.
-        # We'll map A/B/C/D to full label but store only A/B/C/D.
-        labels = [
-            ("A", f"A. {m.options['A']}"),
-            ("B", f"B. {m.options['B']}"),
-            ("C", f"C. {m.options['C']}"),
-            ("D", f"D. {m.options['D']}"),
-        ]
-        display_list = [lab for _, lab in labels]
-        letter_to_display = {k: v for k, v in labels}
-        display_to_letter = {v: k for k, v in labels}
+        r1c1, r1c2 = st.columns(2, gap="medium")
+        with r1c1:
+            if option_button("A", m.options["A"], selected == "A", disabled=not running, key=f"optA_{m.qid}"):
+                st.session_state.answers[m.qid] = "A"
+                autosave_if_needed()
+        with r1c2:
+            if option_button("B", m.options["B"], selected == "B", disabled=not running, key=f"optB_{m.qid}"):
+                st.session_state.answers[m.qid] = "B"
+                autosave_if_needed()
 
-        # Determine default index
-        default_index = None
-        if current_val in letter_to_display:
-            default_index = display_list.index(letter_to_display[current_val])
+        r2c1, r2c2 = st.columns(2, gap="medium")
+        with r2c1:
+            if option_button("C", m.options["C"], selected == "C", disabled=not running, key=f"optC_{m.qid}"):
+                st.session_state.answers[m.qid] = "C"
+                autosave_if_needed()
+        with r2c2:
+            if option_button("D", m.options["D"], selected == "D", disabled=not running, key=f"optD_{m.qid}"):
+                st.session_state.answers[m.qid] = "D"
+                autosave_if_needed()
 
-        selected_display = st.radio(
-            "Select an option",
-            options=display_list,
-            index=default_index if default_index is not None else 0,
-            key=key,
-            label_visibility="collapsed",
-            disabled=not st.session_state.running and not st.session_state.show_report
-        )
-
-        # Save answer only when test is active (running or paused allowed)
-        if st.session_state.running:
-            st.session_state.answers[m.qid] = display_to_letter.get(selected_display)
-
-        # Buttons row (big)
-        b1, b2, b3, b4 = st.columns(4)
-        with b1:
+        nav1, nav2, nav3, nav4 = st.columns(4, gap="medium")
+        with nav1:
             if st.button("Previous", use_container_width=True):
                 goto(idx - 1)
-        with b2:
+        with nav2:
             if st.button("Next", use_container_width=True):
                 goto(idx + 1)
-        with b3:
-            if st.button("Clear", use_container_width=True):
+        with nav3:
+            if st.button("Clear", use_container_width=True, disabled=not running):
                 st.session_state.answers[m.qid] = None
-                st.toast("Cleared answer.", icon="🧽")
-        with b4:
-            if st.button("Jump to first unanswered", use_container_width=True):
+                autosave_if_needed()
+        with nav4:
+            if st.button("First unanswered", use_container_width=True):
                 for j, q in enumerate(mcqs):
                     if st.session_state.answers.get(q.qid) is None:
                         goto(j)
@@ -438,59 +692,56 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Right: palette
     with right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.subheader("Palette")
 
-        # Create a grid of buttons (touch)
+        # 5-column touch palette
         cols = st.columns(5)
         for i, q in enumerate(mcqs):
-            answered = st.session_state.answers.get(q.qid) is not None
-            label = f"{i+1}"
+            ans = st.session_state.answers.get(q.qid)
+            txt = f"✅ {i+1}" if ans is not None else f"⬜ {i+1}"
             col = cols[i % 5]
-            # Style: answered green badge-like using emoji
-            txt = f"✅ {label}" if answered else f"⬜ {label}"
-            if col.button(txt, use_container_width=True):
+            if col.button(txt, key=f"pal_{i}", use_container_width=True):
                 goto(i)
 
-        st.markdown('<div class="small-muted">✅ answered, ⬜ unanswered</div>', unsafe_allow_html=True)
+        st.markdown("<div class='muted'>✅ answered, ⬜ unanswered</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Report area
+    # ---------------- Report ----------------
     if st.session_state.show_report:
         st.divider()
         st.header("Analysis Report")
 
-        summary, rows = compute_report(
+        summary, df = compute_report(
             mcqs=mcqs,
             answers=st.session_state.answers,
             time_spent=st.session_state.time_spent,
             total_seconds=st.session_state.total_seconds,
             remaining_seconds=st.session_state.remaining_seconds,
+            negative_mark=float(st.session_state.negative_mark),
         )
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Score", f"{summary['score']}/{summary['total']}")
-        c2.metric("Correct", summary["correct"])
-        c3.metric("Wrong", summary["wrong"])
-        c4.metric("Unanswered", summary["unanswered"])
-        c5.metric("Accuracy", f"{summary['accuracy']}%")
-        c6.metric("Time", summary["time_taken"])
-
-        df = pd.DataFrame(rows)
+        a, b, c, d, e, f = st.columns(6)
+        a.metric("Score", f"{summary['score']}/{summary['total']}")
+        b.metric("Correct", summary["correct"])
+        c.metric("Wrong", summary["wrong"])
+        d.metric("Unanswered", summary["unanswered"])
+        e.metric("Accuracy", f"{summary['accuracy']}%")
+        f.metric("Time", summary["time_taken"])
 
         st.subheader("Review Table")
-        st.dataframe(df, use_container_width=True, height=380)
+        st.dataframe(df, use_container_width=True, height=420)
 
         st.subheader("Explanations (tap to expand)")
-        for r in rows:
-            title = f"Q{r['#']} — Your: {r['Your'] or '—'} | Correct: {r['Correct']} | {r['Result']}"
+        for _, r in df.iterrows():
+            title = f"Q{int(r['#'])} — Your: {r['Your'] or '—'} | Correct: {r['Correct']} | {r['Result']} | {r.get('Section','')}"
             with st.expander(title, expanded=False):
                 st.write(r["Question"])
                 st.markdown("**Explanation:**")
-                st.write(r["Explanation"] if r["Explanation"] else "No explanation provided in Excel.")
+                st.write(r["Explanation"] if r["Explanation"] else "No explanation in Excel.")
 
+        # Downloads
         st.download_button(
             "Download report as CSV",
             data=df.to_csv(index=False).encode("utf-8"),
@@ -499,7 +750,16 @@ def main():
             use_container_width=True
         )
 
-    # Auto-refresh while running (touch-friendly timer)
+        pdf_bytes = make_pdf(summary, df)
+        st.download_button(
+            "Download report as PDF",
+            data=pdf_bytes,
+            file_name="upsc_test_report.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+
+    # Auto-refresh timer while running (smooth enough, low load)
     if st.session_state.running and not st.session_state.paused:
         time.sleep(0.25)
         st.rerun()
